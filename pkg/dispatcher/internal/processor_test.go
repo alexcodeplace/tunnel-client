@@ -34,6 +34,75 @@ import (
 	"github.com/openai/tunnel-client/pkg/types"
 )
 
+func TestCommandCorrelationHelpers(t *testing.T) {
+	t.Parallel()
+
+	workflow, suffix := splitCommandRequestID("4101007b-d189-4b97-b57d-ad93f44ff376/zy28")
+	require.Equal(t, "4101007b-d189-4b97-b57d-ad93f44ff376", workflow)
+	require.Equal(t, "zy28", suffix)
+
+	workflow, suffix = splitCommandRequestID("missing-suffix")
+	require.Empty(t, workflow)
+	require.Empty(t, suffix)
+
+	req := &jsonrpc.Request{
+		Method: "tools/call",
+		Params: json.RawMessage("{\"name\":\"shell.exec\",\"arguments\":{\"command\":\"node\"}}"),
+	}
+	require.Equal(t, "shell.exec", toolNameFromRequest(req))
+	require.Empty(t, toolNameFromRequest(&jsonrpc.Request{Method: "tools/list"}))
+	require.Empty(t, toolNameFromRequest(&jsonrpc.Request{Method: "tools/call", Params: json.RawMessage("{")}))
+}
+
+func TestCommandCorrelationLogsResultAndNextCommandGap(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	processor := &mcpProcessor{workflowLast: make(map[string]workflowLastCommand)}
+
+	ctx := tunnelctx.ContextWithRequestID(context.Background(), "cmd-one")
+	ctx = tunnelctx.ContextWithControlPlaneCommandRequestID(ctx, types.ControlPlaneRequestID("workflow-1234/aaaa"))
+	req := &jsonrpc.Request{Method: "tools/call", Params: json.RawMessage("{\"name\":\"shell.exec\",\"arguments\":{}}")}
+
+	first := processor.beginCommandCorrelation(ctx, req, logger)
+	first.mcpCompletedAt = first.startedAt.Add(25 * time.Millisecond)
+	first.responseBytes = 8192
+	first.delivery = "accepted"
+	first.statusCode = http.StatusOK
+	first.outcome = "mcp_response"
+	first.tunnelRequestID = "tunnel-one"
+	processor.finishCommandCorrelation(ctx, logger, first)
+
+	ctx2 := tunnelctx.ContextWithRequestID(context.Background(), "cmd-two")
+	ctx2 = tunnelctx.ContextWithControlPlaneCommandRequestID(ctx2, types.ControlPlaneRequestID("workflow-1234/bbbb"))
+	second := processor.beginCommandCorrelation(ctx2, req, logger)
+	second.mcpCompletedAt = second.startedAt.Add(10 * time.Millisecond)
+	second.responseBytes = 64
+	second.delivery = "accepted"
+	second.statusCode = http.StatusOK
+	second.outcome = "mcp_response"
+	processor.finishCommandCorrelation(ctx2, logger, second)
+
+	out := logs.String()
+	require.Contains(t, out, "dispatcher command correlation")
+	require.Contains(t, out, "workflow_id=workflow-1234")
+	require.Contains(t, out, "command_suffix=aaaa")
+	require.Contains(t, out, "tool_name=shell.exec")
+	require.Contains(t, out, "workflow_command_index=1")
+	require.Contains(t, out, "terminal_response_bytes=8192")
+	require.Contains(t, out, "workflow_terminal_bytes=8192")
+	require.Contains(t, out, "terminal_delivery=accepted")
+	require.Contains(t, out, "tunnel_request_id=tunnel-one")
+	require.Contains(t, out, "dispatcher workflow continuation observed")
+	require.Contains(t, out, "previous_request_id=cmd-one")
+	require.Contains(t, out, "current_request_id=cmd-two")
+	require.Contains(t, out, "workflow_command_index=2")
+	require.Contains(t, out, "workflow_prior_terminal_bytes=8192")
+	require.Contains(t, out, "workflow_terminal_bytes=8256")
+	require.Contains(t, out, "next_command_gap_ms=")
+}
+
 func decodeJSONRPCResponse(t *testing.T, raw json.RawMessage) *jsonrpc.Response {
 	t.Helper()
 	if len(raw) == 0 {

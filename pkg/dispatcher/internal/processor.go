@@ -12,6 +12,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -34,6 +35,7 @@ const (
 	defaultAcceptHeaderValue       = "application/json, text/event-stream"
 	maxResponseDeliveryReserve     = 2 * time.Second
 	responseDeliveryReserveDivisor = 10
+	maxWorkflowCorrelationEntries  = 1024
 )
 
 var legacyRequiredProcessorChannels = []types.Channel{
@@ -89,6 +91,8 @@ type mcpProcessor struct {
 	mcpUnixSocketPath string
 	oauthOrigins      []*url.URL
 	withDeadlineCause func(context.Context, time.Time, error) (context.Context, context.CancelFunc)
+	correlationMu     sync.Mutex
+	workflowLast      map[string]workflowLastCommand
 }
 
 // responsePostResult keeps the control-plane request ID together with any
@@ -96,6 +100,144 @@ type mcpProcessor struct {
 type responsePostResult struct {
 	tunnelServiceRequestID types.TunnelServiceRequestID
 	err                    error
+}
+
+type workflowLastCommand struct {
+	requestID     string
+	completedAt   time.Time
+	commandCount  int
+	terminalBytes int64
+}
+
+type commandCorrelation struct {
+	workflowID           string
+	commandSuffix        string
+	requestID            string
+	rpcMethod            string
+	toolName             string
+	startedAt            time.Time
+	mcpCompletedAt       time.Time
+	responseBytes        int
+	delivery             string
+	statusCode           int
+	outcome              string
+	tunnelRequestID      string
+	workflowCommandIndex int
+	workflowPriorBytes   int64
+}
+
+func splitCommandRequestID(value string) (string, string) {
+	workflow, suffix, ok := strings.Cut(value, "/")
+	if !ok || workflow == "" || suffix == "" {
+		return "", ""
+	}
+	return workflow, suffix
+}
+
+func toolNameFromRequest(req *jsonrpc.Request) string {
+	if req == nil || req.Method != "tools/call" || len(req.Params) == 0 {
+		return ""
+	}
+	var params map[string]any
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return ""
+	}
+	name, _ := params["name"].(string)
+	return name
+}
+
+func (p *mcpProcessor) beginCommandCorrelation(ctx context.Context, req *jsonrpc.Request, logger *slog.Logger) *commandCorrelation {
+	now := time.Now()
+	corr := &commandCorrelation{startedAt: now, delivery: "none", outcome: "incomplete"}
+	if req != nil {
+		corr.rpcMethod = req.Method
+		corr.toolName = toolNameFromRequest(req)
+	}
+	if requestID, ok := tunnelctx.RequestIDFromContext(ctx); ok {
+		corr.requestID = requestID
+	}
+	if commandID, ok := tunnelctx.ControlPlaneCommandRequestIDFromContext(ctx); ok {
+		corr.workflowID, corr.commandSuffix = splitCommandRequestID(commandID.String())
+	}
+	if corr.workflowID != "" {
+		p.correlationMu.Lock()
+		previous, ok := p.workflowLast[corr.workflowID]
+		for workflowID, item := range p.workflowLast {
+			if now.Sub(item.completedAt) > 30*time.Minute {
+				delete(p.workflowLast, workflowID)
+			}
+		}
+		if ok {
+			corr.workflowCommandIndex = previous.commandCount + 1
+			corr.workflowPriorBytes = previous.terminalBytes
+		} else {
+			corr.workflowCommandIndex = 1
+		}
+		p.correlationMu.Unlock()
+		if ok {
+			logger.InfoContext(ctx, "dispatcher workflow continuation observed",
+				slog.String("workflow_id", corr.workflowID),
+				slog.String("previous_request_id", previous.requestID),
+				slog.String("current_request_id", corr.requestID),
+				slog.Int("workflow_command_index", corr.workflowCommandIndex),
+				slog.Int64("workflow_prior_terminal_bytes", corr.workflowPriorBytes),
+				slog.Int64("next_command_gap_ms", now.Sub(previous.completedAt).Milliseconds()))
+		}
+	}
+	return corr
+}
+
+func (p *mcpProcessor) finishCommandCorrelation(ctx context.Context, logger *slog.Logger, corr *commandCorrelation) {
+	if corr == nil {
+		return
+	}
+	now := time.Now()
+	if corr.mcpCompletedAt.IsZero() {
+		corr.mcpCompletedAt = now
+	}
+	workflowTotalBytes := corr.workflowPriorBytes + int64(corr.responseBytes)
+	attrs := []any{
+		slog.String("workflow_id", corr.workflowID),
+		slog.String("command_suffix", corr.commandSuffix),
+		slog.String("request_id", corr.requestID),
+		slog.String("rpc_method", corr.rpcMethod),
+		slog.String("tool_name", corr.toolName),
+		slog.Int("workflow_command_index", corr.workflowCommandIndex),
+		slog.Int64("mcp_duration_ms", corr.mcpCompletedAt.Sub(corr.startedAt).Milliseconds()),
+		slog.Int64("total_duration_ms", now.Sub(corr.startedAt).Milliseconds()),
+		slog.Int("terminal_response_bytes", corr.responseBytes),
+		slog.Int64("workflow_terminal_bytes", workflowTotalBytes),
+		slog.String("terminal_delivery", corr.delivery),
+		slog.Int("status_code", corr.statusCode),
+		slog.String("outcome", corr.outcome),
+	}
+	if corr.tunnelRequestID != "" {
+		attrs = append(attrs, slog.String(tclog.FieldTunnelServiceRequestID, corr.tunnelRequestID))
+	}
+	logger.InfoContext(ctx, "dispatcher command correlation", attrs...)
+	if corr.workflowID != "" && corr.delivery == "accepted" {
+		p.correlationMu.Lock()
+		if p.workflowLast == nil {
+			p.workflowLast = make(map[string]workflowLastCommand)
+		}
+		if len(p.workflowLast) >= maxWorkflowCorrelationEntries {
+			var oldestID string
+			var oldest time.Time
+			for workflowID, item := range p.workflowLast {
+				if oldestID == "" || item.completedAt.Before(oldest) {
+					oldestID, oldest = workflowID, item.completedAt
+				}
+			}
+			if oldestID != "" {
+				delete(p.workflowLast, oldestID)
+			}
+		}
+		p.workflowLast[corr.workflowID] = workflowLastCommand{
+			requestID: corr.requestID, completedAt: now,
+			commandCount: corr.workflowCommandIndex, terminalBytes: workflowTotalBytes,
+		}
+		p.correlationMu.Unlock()
+	}
 }
 
 // postTunnelResponse wraps Responder.PostResponse and preserves its request ID
@@ -298,6 +440,7 @@ func NewProcessor(p processorParams) (Processor, error) {
 		mcpUnixSocketPath: p.MCPConfig.UnixSocketPath,
 		oauthOrigins:      append([]*url.URL(nil), p.MCPConfig.OAuthTrustedOrigins...),
 		withDeadlineCause: context.WithDeadlineCause,
+		workflowLast:      make(map[string]workflowLastCommand),
 	}, nil
 }
 
@@ -510,6 +653,8 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 	requestKindAttrs := requestKindAttributes(req)
 	requestKindAttrs = append(requestKindAttrs, attribute.String("channel", channel.String()))
 	latencyRecorded := &latencyFlags{}
+	corr := p.beginCommandCorrelation(ctx, req, logger)
+	defer p.finishCommandCorrelation(context.WithoutCancel(ctx), logger, corr)
 
 	// The control-plane deadline remains authoritative for response delivery.
 	// Give downstream MCP work a slightly earlier deadline so a timeout can still
@@ -533,10 +678,19 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 		}
 		responseHeaders = jsonRPCResponseHeaders(deliveryCtx, logger, responseHeaders)
 		tunnelResponse := types.NewTunnelResponse(channel, encodedError, status, responseHeaders)
+		corr.mcpCompletedAt = time.Now()
+		corr.responseBytes = len(encodedError)
+		corr.statusCode = status
+		corr.outcome = "mcp_execution_timeout"
 		post := p.postTunnelResponse(deliveryCtx, requestID, tunnelResponse)
 		if post.err != nil {
+			corr.delivery = "failed"
 			logger.ErrorContext(deliveryCtx, "failed to post MCP execution timeout response to control plane", post.errorAttrs()...)
 			return post.err
+		}
+		corr.delivery = "accepted"
+		if post.tunnelServiceRequestID != "" {
+			corr.tunnelRequestID = post.tunnelServiceRequestID.String()
 		}
 		p.metrics.recordCommandLatencies(deliveryCtx, p.tunnelID, status, requestKindAttrs, cmd.EnqueuedAt(), cmd.PolledAt(), latencyRecorded)
 		attrs := []any{slog.Int("status_code", status), slog.String("channel", channel.String()), slog.String("rpc_method", req.Method)}
@@ -594,10 +748,19 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 		respHeader.Set("Content-Type", "application/json")
 
 		tunnelResponse := types.NewTunnelResponse(channel, encodedError, status, respHeader)
+		corr.mcpCompletedAt = time.Now()
+		corr.responseBytes = len(encodedError)
+		corr.statusCode = status
+		corr.outcome = "mcp_connect_error"
 		post := p.postTunnelResponse(ctx, requestID, tunnelResponse)
 		if post.err != nil {
+			corr.delivery = "failed"
 			logger.ErrorContext(ctx, "failed to post error response to control plane", post.errorAttrs()...)
 			return post.err
+		}
+		corr.delivery = "accepted"
+		if post.tunnelServiceRequestID != "" {
+			corr.tunnelRequestID = post.tunnelServiceRequestID.String()
 		}
 
 		p.metrics.recordCommandLatencies(ctx, p.tunnelID, status, requestKindAttrs, cmd.EnqueuedAt(), cmd.PolledAt(), latencyRecorded)
@@ -645,10 +808,19 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 		encodedError := preserved.Payload()
 		respHeader = jsonRPCResponseHeaders(ctx, logger, respHeader)
 		tunnelResponse := types.NewTunnelResponse(channel, encodedError, statusCode, respHeader)
+		corr.mcpCompletedAt = time.Now()
+		corr.responseBytes = len(encodedError)
+		corr.statusCode = statusCode
+		corr.outcome = "mcp_preserved_error"
 		post := p.postTunnelResponse(ctx, requestID, tunnelResponse)
 		if post.err != nil {
+			corr.delivery = "failed"
 			logger.ErrorContext(ctx, "failed to post preserved MCP error response to control plane", post.errorAttrs()...)
 			return post.err
+		}
+		corr.delivery = "accepted"
+		if post.tunnelServiceRequestID != "" {
+			corr.tunnelRequestID = post.tunnelServiceRequestID.String()
 		}
 
 		p.metrics.recordCommandLatencies(ctx, p.tunnelID, statusCode, requestKindAttrs, cmd.EnqueuedAt(), cmd.PolledAt(), latencyRecorded)
@@ -681,10 +853,19 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 		}
 
 		tunnelResponse := types.NewTunnelResponse(channel, encodedError, status, respHeader)
+		corr.mcpCompletedAt = time.Now()
+		corr.responseBytes = len(encodedError)
+		corr.statusCode = status
+		corr.outcome = "mcp_upstream_error"
 		post := p.postTunnelResponse(ctx, requestID, tunnelResponse)
 		if post.err != nil {
+			corr.delivery = "failed"
 			logger.ErrorContext(ctx, "failed to post error response to control plane", post.errorAttrs()...)
 			return post.err
+		}
+		corr.delivery = "accepted"
+		if post.tunnelServiceRequestID != "" {
+			corr.tunnelRequestID = post.tunnelServiceRequestID.String()
 		}
 
 		p.metrics.recordCommandLatencies(ctx, p.tunnelID, status, requestKindAttrs, cmd.EnqueuedAt(), cmd.PolledAt(), latencyRecorded)
@@ -733,7 +914,7 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 		return nil
 	}
 
-	responseDelivered := p.forwardResponses(deliveryCtx, mcpCtx, conn, logger, cmd, statusCode, respHeader, requestKindAttrs, latencyRecorded, channel)
+	responseDelivered := p.forwardResponses(deliveryCtx, mcpCtx, conn, logger, cmd, statusCode, respHeader, requestKindAttrs, latencyRecorded, channel, corr)
 	if !responseDelivered && responseDeadlineReached(deliveryCtx) {
 		return deliveryCtx.Err()
 	}
@@ -883,7 +1064,7 @@ func (p *mcpProcessor) processOauthDiscoveryCommand(ctx context.Context, logger 
 // or expire. Intermediate JSON-RPC notifications remain stream events. If the
 // downstream connection ends first, the dispatcher posts a terminal error
 // response so product callers do not wait forever.
-func (p *mcpProcessor) forwardResponses(deliveryCtx, mcpCtx context.Context, conn mcpclient.ForwardingConnection, logger *slog.Logger, cmd controlplane.JsonRpcCommand, responseCode int, responseHeaders http.Header, metricAttrs []attribute.KeyValue, latencyRecorded *latencyFlags, channel types.Channel) (responseDelivered bool) {
+func (p *mcpProcessor) forwardResponses(deliveryCtx, mcpCtx context.Context, conn mcpclient.ForwardingConnection, logger *slog.Logger, cmd controlplane.JsonRpcCommand, responseCode int, responseHeaders http.Header, metricAttrs []attribute.KeyValue, latencyRecorded *latencyFlags, channel types.Channel, corr *commandCorrelation) (responseDelivered bool) {
 	ttlCtx := mcpCtx
 	cancel := func() {}
 	if p.connectionMaxTTL > 0 {
@@ -925,8 +1106,17 @@ func (p *mcpProcessor) forwardResponses(deliveryCtx, mcpCtx context.Context, con
 		}
 
 		tunnelResponse := types.NewTunnelResponse(channel, encodedError, statusCode, jsonRPCResponseHeaders(deliveryCtx, logger, responseHeaders))
+		if corr != nil {
+			corr.mcpCompletedAt = time.Now()
+			corr.responseBytes = len(encodedError)
+			corr.statusCode = statusCode
+			corr.outcome = "terminal_downstream_error"
+		}
 		post := p.postTunnelResponse(deliveryCtx, cmd.RequestID(), tunnelResponse)
 		if post.err != nil {
+			if corr != nil {
+				corr.delivery = "failed"
+			}
 			attrs := post.errorAttrs()
 			if errors.Is(post.err, context.DeadlineExceeded) || errors.Is(post.err, context.Canceled) {
 				if connectionTTLReached(ttlCtx) {
@@ -940,6 +1130,12 @@ func (p *mcpProcessor) forwardResponses(deliveryCtx, mcpCtx context.Context, con
 			return
 		}
 
+		if corr != nil {
+			corr.delivery = "accepted"
+			if post.tunnelServiceRequestID != "" {
+				corr.tunnelRequestID = post.tunnelServiceRequestID.String()
+			}
+		}
 		p.metrics.recordCommandLatencies(deliveryCtx, p.tunnelID, statusCode, metricAttrs, cmd.EnqueuedAt(), cmd.PolledAt(), latencyRecorded)
 		responseDelivered = true
 
@@ -1047,9 +1243,18 @@ func (p *mcpProcessor) forwardResponses(deliveryCtx, mcpCtx context.Context, con
 		responseHeaders = jsonRPCResponseHeaders(deliveryCtx, logger, responseHeaders)
 
 		tunnelResponse := types.NewTunnelResponse(channel, encodedResponse, responseCode, responseHeaders)
+		if corr != nil {
+			corr.mcpCompletedAt = time.Now()
+			corr.responseBytes = len(encodedResponse)
+			corr.statusCode = responseCode
+			corr.outcome = "mcp_response"
+		}
 
 		post := p.postTunnelResponse(deliveryCtx, cmd.RequestID(), tunnelResponse)
 		if post.err != nil {
+			if corr != nil {
+				corr.delivery = "failed"
+			}
 			attrs := post.errorAttrs()
 			if errors.Is(post.err, context.DeadlineExceeded) || errors.Is(post.err, context.Canceled) {
 				if connectionTTLReached(ttlCtx) {
@@ -1063,6 +1268,12 @@ func (p *mcpProcessor) forwardResponses(deliveryCtx, mcpCtx context.Context, con
 			return
 		}
 
+		if corr != nil {
+			corr.delivery = "accepted"
+			if post.tunnelServiceRequestID != "" {
+				corr.tunnelRequestID = post.tunnelServiceRequestID.String()
+			}
+		}
 		p.metrics.recordCommandLatencies(deliveryCtx, p.tunnelID, responseCode, metricAttrs, cmd.EnqueuedAt(), cmd.PolledAt(), latencyRecorded)
 		attrs := []any{
 			slog.Bool("finalResponse", finalResponse),
