@@ -663,8 +663,13 @@ func (p *mcpProcessor) processJsonRpcCommand(ctx context.Context, logger *slog.L
 	requestKindAttrs := requestKindAttributes(req)
 	requestKindAttrs = append(requestKindAttrs, attribute.String("channel", channel.String()))
 	latencyRecorded := &latencyFlags{}
-	corr := p.beginCommandCorrelation(ctx, req, logger)
-	defer p.finishCommandCorrelation(context.WithoutCancel(ctx), logger, corr)
+	// Diagnostic correlation records intentionally use the base dispatcher
+	// logger rather than the request-annotated logger. The correlation payload
+	// carries only hashed refs, so raw request/control-plane/rpc identifiers do
+	// not get reintroduced by LoggerWithContextIdentifiers.
+	corrLogger := p.logger
+	corr := p.beginCommandCorrelation(ctx, req, corrLogger)
+	defer p.finishCommandCorrelation(context.WithoutCancel(ctx), corrLogger, corr)
 
 	// The control-plane deadline remains authoritative for response delivery.
 	// Give downstream MCP work a slightly earlier deadline so a timeout can still

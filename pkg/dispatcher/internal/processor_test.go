@@ -2508,6 +2508,22 @@ func TestProcessorLogsJSONRPCErrorResponseCorrelation(t *testing.T) {
 	require.NotContains(t, logOutput, "rpc_error_message")
 	require.NotContains(t, logOutput, "method-not-found")
 	require.NotContains(t, logOutput, "access_token")
+
+	var correlationLine string
+	for _, line := range strings.Split(logOutput, "\n") {
+		if strings.Contains(line, "dispatcher command correlation") {
+			correlationLine = line
+			break
+		}
+	}
+	require.NotEmpty(t, correlationLine)
+	require.Contains(t, correlationLine, "request_ref="+correlationRef("tools-list-request"))
+	require.Contains(t, correlationLine, "workflow_ref="+correlationRef("cmd_req_tools_list"))
+	require.Contains(t, correlationLine, "tunnel_request_ref="+correlationRef("post_req_tools_list"))
+	require.NotContains(t, correlationLine, "request_id=tools-list-request")
+	require.NotContains(t, correlationLine, "cmd_request_id=cmd_req_tools_list")
+	require.NotContains(t, correlationLine, "tunnel_request_id=post_req_tools_list")
+	require.NotContains(t, correlationLine, "rpc_request_id=tools-list-rpc")
 	require.NotContains(t, logOutput, "secret-token")
 }
 
