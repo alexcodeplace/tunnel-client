@@ -34,6 +34,108 @@ import (
 	"github.com/openai/tunnel-client/pkg/types"
 )
 
+func TestCommandCorrelationHelpers(t *testing.T) {
+	t.Parallel()
+
+	workflow, suffix := splitCommandRequestID("4101007b-d189-4b97-b57d-ad93f44ff376/zy28")
+	require.Equal(t, "4101007b-d189-4b97-b57d-ad93f44ff376", workflow)
+	require.Equal(t, "zy28", suffix)
+
+	workflow, suffix = splitCommandRequestID("missing-suffix")
+	require.Empty(t, workflow)
+	require.Empty(t, suffix)
+
+	req := &jsonrpc.Request{
+		Method: "tools/call",
+		Params: json.RawMessage("{\"name\":\"shell.exec\",\"arguments\":{\"command\":\"node\"}}"),
+	}
+	require.Equal(t, "shell.exec", toolNameFromRequest(req))
+	require.Empty(t, toolNameFromRequest(&jsonrpc.Request{Method: "tools/list"}))
+	require.Empty(t, toolNameFromRequest(&jsonrpc.Request{Method: "tools/call", Params: json.RawMessage("{")}))
+}
+
+func TestCommandCorrelationLogsTerminalDeliveryAndContinuation(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	processor := &mcpProcessor{workflowLast: make(map[string]workflowCorrelationState)}
+
+	ctx := tunnelctx.ContextWithRequestID(context.Background(), "cmd-one")
+	ctx = tunnelctx.ContextWithControlPlaneCommandRequestID(ctx, types.ControlPlaneRequestID("workflow-1234/aaaa"))
+	req := &jsonrpc.Request{Method: "tools/call", Params: json.RawMessage("{\"name\":\"shell.exec\",\"arguments\":{}}")}
+
+	first := processor.beginCommandCorrelation(ctx, req, logger)
+	markCorrelationPost(first, first.startedAt.Add(25*time.Millisecond), 8192, http.StatusOK, "mcp_response",
+		responsePostResult{tunnelServiceRequestID: types.TunnelServiceRequestID("tunnel-one")})
+	processor.finishCommandCorrelation(ctx, logger, first)
+
+	ctx2 := tunnelctx.ContextWithRequestID(context.Background(), "cmd-two")
+	ctx2 = tunnelctx.ContextWithControlPlaneCommandRequestID(ctx2, types.ControlPlaneRequestID("workflow-1234/bbbb"))
+	second := processor.beginCommandCorrelation(ctx2, req, logger)
+	markCorrelationPost(second, second.startedAt.Add(10*time.Millisecond), 64, http.StatusOK, "mcp_response", responsePostResult{})
+	processor.finishCommandCorrelation(ctx2, logger, second)
+
+	out := logs.String()
+	require.Contains(t, out, "dispatcher command correlation")
+	require.Contains(t, out, "workflow_id=workflow-1234")
+	require.Contains(t, out, "command_suffix=aaaa")
+	require.Contains(t, out, "tool_name=shell.exec")
+	require.Contains(t, out, "workflow_command_index=1")
+	require.Contains(t, out, "terminal_response_bytes=8192")
+	require.Contains(t, out, "workflow_terminal_bytes=8192")
+	require.Contains(t, out, "terminal_delivery=accepted")
+	require.Contains(t, out, "tunnel_request_id=tunnel-one")
+	require.Contains(t, out, "dispatcher workflow continuation observed")
+	require.Contains(t, out, "previous_request_id=cmd-one")
+	require.Contains(t, out, "current_request_id=cmd-two")
+	require.Contains(t, out, "workflow_command_index=2")
+	require.Contains(t, out, "workflow_prior_terminal_bytes=8192")
+	require.Contains(t, out, "workflow_terminal_bytes=8256")
+	require.Contains(t, out, "next_command_gap_ms=")
+}
+
+func TestCommandCorrelationBoundsWorkflowState(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	processor := &mcpProcessor{workflowLast: make(map[string]workflowCorrelationState)}
+	now := time.Now()
+	for i := 0; i < maxWorkflowCorrelations; i++ {
+		processor.workflowLast[fmt.Sprintf("workflow-%04d", i)] = workflowCorrelationState{
+			requestID:     fmt.Sprintf("request-%04d", i),
+			completedAt:   now.Add(-time.Duration(maxWorkflowCorrelations-i) * time.Second),
+			commandCount:  1,
+			terminalBytes: 64,
+		}
+	}
+
+	ctx := tunnelctx.ContextWithRequestID(context.Background(), "new-request")
+	ctx = tunnelctx.ContextWithControlPlaneCommandRequestID(ctx, types.ControlPlaneRequestID("new-workflow/abcd"))
+	req := &jsonrpc.Request{Method: "tools/call", Params: json.RawMessage(`{"name":"shell.exec"}`)}
+	corr := processor.beginCommandCorrelation(ctx, req, logger)
+	markCorrelationPost(corr, time.Now(), 32, http.StatusOK, "mcp_response", responsePostResult{})
+	processor.finishCommandCorrelation(ctx, logger, corr)
+
+	require.Len(t, processor.workflowLast, maxWorkflowCorrelations)
+	_, oldestPresent := processor.workflowLast["workflow-0000"]
+	require.False(t, oldestPresent)
+	_, newPresent := processor.workflowLast["new-workflow"]
+	require.True(t, newPresent)
+}
+
+func TestMarkCorrelationPostRecordsDeliveryFailure(t *testing.T) {
+	t.Parallel()
+
+	corr := &commandCorrelation{startedAt: time.Now()}
+	markCorrelationPost(corr, corr.startedAt.Add(time.Millisecond), 128, http.StatusBadGateway, "terminal_downstream_error",
+		responsePostResult{err: errors.New("post failed")})
+	require.Equal(t, "failed", corr.delivery)
+	require.Equal(t, "terminal_downstream_error", corr.outcome)
+	require.Equal(t, 128, corr.responseBytes)
+	require.Equal(t, http.StatusBadGateway, corr.statusCode)
+}
+
 func decodeJSONRPCResponse(t *testing.T, raw json.RawMessage) *jsonrpc.Response {
 	t.Helper()
 	if len(raw) == 0 {
