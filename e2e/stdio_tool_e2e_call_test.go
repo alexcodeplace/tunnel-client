@@ -334,7 +334,27 @@ func TestHarnessStdioResponseDeadlineKeepsServingAfterTimedOutRequest(t *testing
 			}`),
 			nil,
 		), "2s"),
-		NoResponseExpected: true,
+		ExpectedResponses: []mocktunnelservice.ExpectedResponse{{
+			RequestID: timedOutRequestID,
+			Assert: func(tb testing.TB, resp mocktunnelservice.ReceivedResponse) {
+				if resp.ResponseType != string(wiretypes.ResponsePayloadJSONRPC) {
+					tb.Fatalf("timeout response type mismatch: got %q", resp.ResponseType)
+				}
+				if resp.ResponseCode != http.StatusGatewayTimeout {
+					tb.Fatalf("timeout response code mismatch: got %d", resp.ResponseCode)
+				}
+				var payload map[string]any
+				if err := json.Unmarshal(resp.JSONResponse, &payload); err != nil {
+					tb.Fatalf("decode timeout response payload: %v", err)
+				}
+				if payload["id"] != timedOutCallID {
+					tb.Fatalf("timeout response ID mismatch: got %v want %q", payload["id"], timedOutCallID)
+				}
+				if payload["error"] == nil {
+					tb.Fatalf("timeout response must contain a JSON-RPC error: %s", string(resp.JSONResponse))
+				}
+			},
+		}},
 	}
 	recoveryCommand := mocktunnelservice.CommandResponse{
 		Command: mocktunnelservice.NewCommand(
@@ -404,8 +424,11 @@ func TestHarnessStdioResponseDeadlineKeepsServingAfterTimedOutRequest(t *testing
 	if got := string(invocations); !strings.Contains(got, "timeout\n") || !strings.Contains(got, "recovered\n") {
 		t.Fatalf("stdio server did not observe both commands: %q", got)
 	}
-	if !strings.Contains(logs.String(), "command response deadline reached; dropping without posting a response") {
-		t.Fatalf("missing response deadline log:\n%s", logs.String())
+	if !strings.Contains(logs.String(), "MCP execution deadline reached; delivering terminal timeout response") {
+		t.Fatalf("missing execution deadline delivery log:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "dropping without posting a response") {
+		t.Fatalf("timed-out command was dropped instead of receiving a terminal response:\n%s", logs.String())
 	}
 	// ExecuteScenarious stops the client before returning, and normal stdio
 	// teardown emits the generic shutdown warning.

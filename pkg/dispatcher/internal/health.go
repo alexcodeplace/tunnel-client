@@ -24,7 +24,7 @@ func recordWorkFailure(ctx context.Context, err error, status int) {
 	if outcome == nil {
 		return
 	}
-	timedOut := errors.Is(err, context.DeadlineExceeded) || errors.Is(context.Cause(ctx), errResponseDeadlineExceeded) || errors.Is(context.Cause(ctx), errConnectionTTLExceeded) || status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout
+	timedOut := errors.Is(err, context.DeadlineExceeded) || errors.Is(context.Cause(ctx), errResponseDeadlineExceeded) || errors.Is(context.Cause(ctx), errMCPExecutionDeadlineExceeded) || errors.Is(context.Cause(ctx), errConnectionTTLExceeded) || status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout
 	var networkError net.Error
 	if errors.As(err, &networkError) && networkError.Timeout() {
 		timedOut = true

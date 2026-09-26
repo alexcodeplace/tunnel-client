@@ -224,7 +224,35 @@ func TestProcessorDropsExpiredCommandBeforeMCPOrResponse(t *testing.T) {
 	require.Zero(t, responder.calls.Load(), "expired command must not post a response")
 }
 
-func TestProcessorAppliesResponseDeadlineToMCPAndResponsePost(t *testing.T) {
+func TestMCPExecutionDeadlineReservesDeliveryBudget(t *testing.T) {
+	t.Parallel()
+
+	polledAt := time.Unix(1_700_000_000, 0)
+	for _, tc := range []struct {
+		name    string
+		budget  time.Duration
+		reserve time.Duration
+	}{
+		{name: "long budget capped", budget: time.Minute, reserve: 2 * time.Second},
+		{name: "ten second budget", budget: 10 * time.Second, reserve: time.Second},
+		{name: "short budget proportional", budget: 4500 * time.Millisecond, reserve: 450 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			responseDeadline := polledAt.Add(tc.budget)
+			got, ok := mcpExecutionDeadline(responseDeadline, polledAt)
+			require.True(t, ok)
+			require.Equal(t, responseDeadline.Add(-tc.reserve), got)
+		})
+	}
+
+	_, ok := mcpExecutionDeadline(polledAt, polledAt)
+	require.False(t, ok)
+	_, ok = mcpExecutionDeadline(polledAt.Add(time.Second), time.Time{})
+	require.False(t, ok)
+}
+
+func TestProcessorReservesResponseDeadlineForTerminalPost(t *testing.T) {
 	t.Parallel()
 
 	id, err := jsonrpc.MakeID("deadline-propagation")
@@ -235,96 +263,116 @@ func TestProcessorAppliesResponseDeadlineToMCPAndResponsePost(t *testing.T) {
 	transport := &deadlineObservingTransport{conn: conn}
 	responder := &deadlineObservingResponder{}
 	processor := newDeadlineTestProcessor(t, transport, responder)
-	responseDeadline := time.Now().Add(time.Minute)
+	polledAt := time.Now()
+	responseDeadline := polledAt.Add(time.Minute)
 	command := &fakePolledCommand{
 		id:                  "deadline-propagation-command",
 		message:             &jsonrpc.Request{ID: id, Method: "tools/list"},
+		polledAt:            polledAt,
 		shardToken:          "deadline-propagation-shard",
 		responseDeadline:    responseDeadline,
 		hasResponseDeadline: true,
 	}
 
 	require.NoError(t, processor.Process(context.Background(), command))
-	wantDeadline := responseDeadline
-	require.True(t, transport.deadline.Equal(wantDeadline), "Connect deadline = %v, want %v", transport.deadline, wantDeadline)
-	require.True(t, conn.writeDeadline.Equal(wantDeadline), "Write deadline = %v, want %v", conn.writeDeadline, wantDeadline)
-	require.True(t, conn.readDeadline.Equal(wantDeadline), "Read deadline = %v, want %v", conn.readDeadline, wantDeadline)
-	require.True(t, responder.deadline.Equal(wantDeadline), "PostResponse deadline = %v, want %v", responder.deadline, wantDeadline)
+	mcpDeadline := responseDeadline.Add(-maxResponseDeliveryReserve)
+	require.True(t, transport.deadline.Equal(mcpDeadline), "Connect deadline = %v, want %v", transport.deadline, mcpDeadline)
+	require.True(t, conn.writeDeadline.Equal(mcpDeadline), "Write deadline = %v, want %v", conn.writeDeadline, mcpDeadline)
+	require.True(t, conn.readDeadline.Equal(mcpDeadline), "Read deadline = %v, want %v", conn.readDeadline, mcpDeadline)
+	require.True(t, responder.deadline.Equal(responseDeadline), "PostResponse deadline = %v, want %v", responder.deadline, responseDeadline)
 }
 
-func TestProcessorDeadlineDuringReadClosesMCPAndPostsNothing(t *testing.T) {
+func TestProcessorExecutionDeadlineDuringReadPostsTimeoutResponse(t *testing.T) {
 	t.Parallel()
 
 	var logs bytes.Buffer
 	conn := newDeadlineBlockingConnection()
 	transport := &stubForwardingTransport{conn: conn}
-	responder := &countingResponder{}
+	responder := newRecordingResponder()
 	processor := newDeadlineTestProcessor(t, transport, responder)
 	processor.logger = slog.New(slog.NewTextHandler(&logs, nil))
-	var expire context.CancelCauseFunc
+	var expireExecution context.CancelCauseFunc
 	processor.withDeadlineCause = func(ctx context.Context, _ time.Time, cause error) (context.Context, context.CancelFunc) {
 		deadlineCtx, cancelCause := context.WithCancelCause(ctx)
-		expire = cancelCause
+		if errors.Is(cause, errMCPExecutionDeadlineExceeded) {
+			expireExecution = cancelCause
+		}
 		return deadlineCtx, func() { cancelCause(context.Canceled) }
 	}
 	id, err := jsonrpc.MakeID("blocking-read")
 	require.NoError(t, err)
+	polledAt := time.Now()
 	command := &fakePolledCommand{
 		id:                  "blocking-read-command",
 		message:             &jsonrpc.Request{ID: id, Method: "tools/list"},
+		polledAt:            polledAt,
 		shardToken:          "blocking-read-shard",
-		responseDeadline:    time.Now().Add(time.Hour),
+		responseDeadline:    polledAt.Add(time.Hour),
 		hasResponseDeadline: true,
 	}
 
 	done := make(chan error, 1)
 	go func() { done <- processor.Process(context.Background(), command) }()
 	waitForSignal(t, conn.readStarted, "MCP read to start")
-	expire(errResponseDeadlineExceeded)
-	require.NoError(t, waitForResult(t, done, "processor to stop after deadline"))
+	require.NotNil(t, expireExecution)
+	expireExecution(errMCPExecutionDeadlineExceeded)
+	require.NoError(t, waitForResult(t, done, "processor to stop after execution deadline"))
 	waitForSignal(t, conn.closed, "MCP connection to close")
-	require.Zero(t, responder.calls.Load(), "deadline expiry must not synthesize a response")
-	require.Contains(t, logs.String(), "command response deadline reached; dropping without posting a response")
+
+	got := responder.waitForResponse(t)
+	require.Equal(t, command.id, got.requestID)
+	require.Equal(t, http.StatusGatewayTimeout, got.response.ResponseCode())
+	resp := decodeJSONRPCResponse(t, got.response.Payload())
+	require.NotNil(t, resp.Error)
+	require.Contains(t, logs.String(), "MCP execution deadline reached; delivering terminal timeout response")
+	require.NotContains(t, logs.String(), "dropping without posting a response")
 }
 
-func TestProcessorDeadlineDuringReadRetiresSharedMCPAndPostsNothing(t *testing.T) {
+func TestProcessorExecutionDeadlineDuringReadRetiresSharedMCPAndPostsTimeoutResponse(t *testing.T) {
 	t.Parallel()
 
 	var logs bytes.Buffer
 	conn := newDeadlineRetiringConnection()
 	transport := &stubForwardingTransport{conn: conn}
-	responder := &countingResponder{}
+	responder := newRecordingResponder()
 	processor := newDeadlineTestProcessor(t, transport, responder)
 	processor.logger = slog.New(slog.NewTextHandler(&logs, nil))
-	var expire context.CancelCauseFunc
+	var expireExecution context.CancelCauseFunc
 	processor.withDeadlineCause = func(ctx context.Context, _ time.Time, cause error) (context.Context, context.CancelFunc) {
 		deadlineCtx, cancelCause := context.WithCancelCause(ctx)
-		expire = cancelCause
+		if errors.Is(cause, errMCPExecutionDeadlineExceeded) {
+			expireExecution = cancelCause
+		}
 		return deadlineCtx, func() { cancelCause(context.Canceled) }
 	}
 	id, err := jsonrpc.MakeID("retired-blocking-read")
 	require.NoError(t, err)
+	polledAt := time.Now()
 	command := &fakePolledCommand{
 		id:                  "retired-blocking-read-command",
 		message:             &jsonrpc.Request{ID: id, Method: "tools/list"},
+		polledAt:            polledAt,
 		shardToken:          "retired-blocking-read-shard",
-		responseDeadline:    time.Now().Add(time.Hour),
+		responseDeadline:    polledAt.Add(time.Hour),
 		hasResponseDeadline: true,
 	}
 
 	done := make(chan error, 1)
 	go func() { done <- processor.Process(context.Background(), command) }()
 	waitForSignal(t, conn.readStarted, "MCP read to start")
-	expire(errResponseDeadlineExceeded)
-	require.NoError(t, waitForResult(t, done, "processor to stop after deadline"))
-	require.True(t, conn.retired.Load(), "response deadline must retire shared MCP lifecycle")
+	require.NotNil(t, expireExecution)
+	expireExecution(errMCPExecutionDeadlineExceeded)
+	require.NoError(t, waitForResult(t, done, "processor to stop after execution deadline"))
+	require.True(t, conn.retired.Load(), "execution deadline must retire shared MCP lifecycle")
 	select {
 	case <-conn.closed:
-		t.Fatal("response deadline must not close shared MCP connection")
+		t.Fatal("execution deadline must not close shared MCP connection")
 	default:
 	}
-	require.Zero(t, responder.calls.Load(), "deadline expiry must not synthesize a response")
-	require.Contains(t, logs.String(), "command response deadline reached; dropping without posting a response")
+
+	got := responder.waitForResponse(t)
+	require.Equal(t, http.StatusGatewayTimeout, got.response.ResponseCode())
+	require.NotContains(t, logs.String(), "dropping without posting a response")
 	require.NotContains(t, logs.String(), "MCP connection TTL reached")
 }
 
@@ -347,11 +395,13 @@ func TestProcessorDoesNotSwallowEarlierParentDeadline(t *testing.T) {
 	processor := newDeadlineTestProcessor(t, transport, responder)
 	id, err := jsonrpc.MakeID("parent-deadline")
 	require.NoError(t, err)
+	polledAt := time.Now()
 	command := &fakePolledCommand{
 		id:                  "parent-deadline-command",
 		message:             &jsonrpc.Request{ID: id, Method: "tools/list"},
+		polledAt:            polledAt,
 		shardToken:          "parent-deadline-shard",
-		responseDeadline:    time.Now().Add(time.Hour),
+		responseDeadline:    polledAt.Add(time.Hour),
 		hasResponseDeadline: true,
 	}
 	parentCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
@@ -362,7 +412,7 @@ func TestProcessorDoesNotSwallowEarlierParentDeadline(t *testing.T) {
 	require.Zero(t, responder.calls.Load())
 }
 
-func TestProcessorDeadlineCancelsResponsePostWithoutClosingCompletedMCP(t *testing.T) {
+func TestProcessorResponseDeadlineCancelsTerminalPostWithoutClosingCompletedMCP(t *testing.T) {
 	t.Parallel()
 
 	id, err := jsonrpc.MakeID("blocking-post")
@@ -370,24 +420,29 @@ func TestProcessorDeadlineCancelsResponsePostWithoutClosingCompletedMCP(t *testi
 	conn := newResponseThenTrackCloseConnection(&jsonrpc.Response{ID: id, Result: json.RawMessage(`{"ok":true}`)})
 	responder := newDeadlineBlockingResponder()
 	processor := newDeadlineTestProcessor(t, &stubForwardingTransport{conn: conn}, responder)
-	var expire context.CancelCauseFunc
+	var expireResponse context.CancelCauseFunc
 	processor.withDeadlineCause = func(ctx context.Context, _ time.Time, cause error) (context.Context, context.CancelFunc) {
 		deadlineCtx, cancelCause := context.WithCancelCause(ctx)
-		expire = cancelCause
+		if errors.Is(cause, errResponseDeadlineExceeded) {
+			expireResponse = cancelCause
+		}
 		return deadlineCtx, func() { cancelCause(context.Canceled) }
 	}
+	polledAt := time.Now()
 	command := &fakePolledCommand{
 		id:                  "blocking-post-command",
 		message:             &jsonrpc.Request{ID: id, Method: "tools/list"},
+		polledAt:            polledAt,
 		shardToken:          "blocking-post-shard",
-		responseDeadline:    time.Now().Add(time.Hour),
+		responseDeadline:    polledAt.Add(time.Hour),
 		hasResponseDeadline: true,
 	}
 
 	done := make(chan error, 1)
 	go func() { done <- processor.Process(context.Background(), command) }()
 	waitForSignal(t, responder.started, "response POST to start")
-	expire(errResponseDeadlineExceeded)
+	require.NotNil(t, expireResponse)
+	expireResponse(errResponseDeadlineExceeded)
 	waitForSignal(t, responder.canceled, "response POST to cancel")
 	require.NoError(t, waitForResult(t, done, "processor to stop after response POST deadline"))
 	require.False(t, conn.closed.Load(), "completed MCP lifecycle must not be closed after response POST expiry")
