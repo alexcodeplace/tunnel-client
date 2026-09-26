@@ -2,6 +2,8 @@ package dispatcherinternal
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -126,6 +128,14 @@ type commandCorrelation struct {
 	workflowPriorBytes   int64
 }
 
+func correlationRef(value string) string {
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:8])
+}
+
 func splitCommandRequestID(value string) (string, string) {
 	workflow, suffix, ok := strings.Cut(value, "/")
 	if !ok || workflow == "" || suffix == "" {
@@ -176,9 +186,9 @@ func (p *mcpProcessor) beginCommandCorrelation(ctx context.Context, req *jsonrpc
 		p.correlationMu.Unlock()
 		if ok {
 			logger.InfoContext(ctx, "dispatcher workflow continuation observed",
-				slog.String("workflow_id", corr.workflowID),
-				slog.String("previous_request_id", previous.requestID),
-				slog.String("current_request_id", corr.requestID),
+				slog.String("workflow_ref", correlationRef(corr.workflowID)),
+				slog.String("previous_request_ref", correlationRef(previous.requestID)),
+				slog.String("current_request_ref", correlationRef(corr.requestID)),
 				slog.Int("workflow_command_index", corr.workflowCommandIndex),
 				slog.Int64("workflow_prior_terminal_bytes", corr.workflowPriorBytes),
 				slog.Int64("next_command_gap_ms", now.Sub(previous.completedAt).Milliseconds()))
@@ -197,9 +207,9 @@ func (p *mcpProcessor) finishCommandCorrelation(ctx context.Context, logger *slo
 	}
 	workflowTotalBytes := corr.workflowPriorBytes + int64(corr.responseBytes)
 	attrs := []any{
-		slog.String("workflow_id", corr.workflowID),
-		slog.String("command_suffix", corr.commandSuffix),
-		slog.String("request_id", corr.requestID),
+		slog.String("workflow_ref", correlationRef(corr.workflowID)),
+		slog.String("command_ref", correlationRef(corr.commandSuffix)),
+		slog.String("request_ref", correlationRef(corr.requestID)),
 		slog.String("rpc_method", corr.rpcMethod),
 		slog.String("tool_name", corr.toolName),
 		slog.Int("workflow_command_index", corr.workflowCommandIndex),
@@ -212,7 +222,7 @@ func (p *mcpProcessor) finishCommandCorrelation(ctx context.Context, logger *slo
 		slog.String("outcome", corr.outcome),
 	}
 	if corr.tunnelRequestID != "" {
-		attrs = append(attrs, slog.String(tclog.FieldTunnelServiceRequestID, corr.tunnelRequestID))
+		attrs = append(attrs, slog.String("tunnel_request_ref", correlationRef(corr.tunnelRequestID)))
 	}
 	logger.InfoContext(ctx, "dispatcher command correlation", attrs...)
 	if corr.workflowID != "" && corr.delivery == "accepted" {
