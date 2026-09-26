@@ -2485,7 +2485,7 @@ func TestProcessorLogsJSONRPCErrorResponseCorrelation(t *testing.T) {
 		enqueuedAt: time.Now(),
 		polledAt:   time.Now(),
 		headers: http.Header{
-			"X-Request-Id": []string{"cmd_req_tools_list"},
+			"X-Request-Id": []string{"workflow-tools-list/aaaa"},
 		},
 		shardToken: "shard-tools-list",
 	}
@@ -2493,12 +2493,12 @@ func TestProcessorLogsJSONRPCErrorResponseCorrelation(t *testing.T) {
 	require.NoError(t, processor.Process(context.Background(), cmd))
 	got := responder.waitForResponse(t)
 	require.Equal(t, cmd.id, got.requestID)
-	require.Equal(t, "cmd_req_tools_list", got.controlPlaneCommandRequestID)
+	require.Equal(t, "workflow-tools-list/aaaa", got.controlPlaneCommandRequestID)
 
 	logOutput := buf.String()
 	require.Contains(t, logOutput, "dispatcher delivered response to control plane")
 	require.Contains(t, logOutput, "request_id=tools-list-request")
-	require.Contains(t, logOutput, "cmd_request_id=cmd_req_tools_list")
+	require.Contains(t, logOutput, "cmd_request_id=workflow-tools-list/aaaa")
 	require.Contains(t, logOutput, "tunnel_request_id=post_req_tools_list")
 	require.Contains(t, logOutput, "rpc_request_id=tools-list-rpc")
 	require.Contains(t, logOutput, "rpc_method=tools/list")
@@ -2518,10 +2518,12 @@ func TestProcessorLogsJSONRPCErrorResponseCorrelation(t *testing.T) {
 	}
 	require.NotEmpty(t, correlationLine)
 	require.Contains(t, correlationLine, "request_ref="+correlationRef("tools-list-request"))
-	require.Contains(t, correlationLine, "workflow_ref="+correlationRef("cmd_req_tools_list"))
+	require.Contains(t, correlationLine, "workflow_ref="+correlationRef("workflow-tools-list"))
+	require.Contains(t, correlationLine, "command_ref="+correlationRef("aaaa"))
 	require.Contains(t, correlationLine, "tunnel_request_ref="+correlationRef("post_req_tools_list"))
 	require.NotContains(t, correlationLine, "request_id=tools-list-request")
-	require.NotContains(t, correlationLine, "cmd_request_id=cmd_req_tools_list")
+	require.NotContains(t, correlationLine, "cmd_request_id=workflow-tools-list/aaaa")
+	require.NotContains(t, correlationLine, "workflow-tools-list")
 	require.NotContains(t, correlationLine, "tunnel_request_id=post_req_tools_list")
 	require.NotContains(t, correlationLine, "rpc_request_id=tools-list-rpc")
 	require.NotContains(t, logOutput, "secret-token")
